@@ -1,0 +1,1 @@
+Nothing should be ignored in this case, as only a Python source file (`bot_v3.py`) was added without any build artifacts, dependencies, or temporary files.
