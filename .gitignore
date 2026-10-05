@@ -1,0 +1,7 @@
+(empty)
+# секреты и локальное состояние
+.env
+bot_state.json
+trades.json
+*.log
+__pycache__/
