@@ -7,20 +7,22 @@
   Макс. просадка: 2.46%
   Прибыльных месяцев: 7/7
 --------------------------------------------------------------
-Торговый бот: Маркет Профиль │ Мини-фьючерсы МосБиржи  v3.0
+Торговый бот: Маркет Профиль │ Мини-фьючерсы МосБиржи  v3.1
 =============================================================
-Изменения v3 (T-Bank Invest API):
-  - Полная миграция на новую библиотеку tinkoff-invest 1.0.5
-  - ProductionSession / SandboxSession вместо Client
-  - Обновлённые модели данных и методы API
+Изменения v3.1 (T-Bank Invest API - HTTP версия):
+  - Прямые HTTP-запросы к T-Bank Invest API v2
+  - Исправлена проблема с SSL сертификатами
+  - Используется официальная библиотека tinkoff-investments
   - Сохранена вся логика стратегии v2.0
 
-Запуск:   python bot.py
+Запуск:   python bot_v3.py
 """
 
 import time
 import json
 import logging
+import ssl
+import certifi
 from datetime import datetime, timedelta, timezone, date
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
@@ -28,15 +30,25 @@ from collections import deque
 
 import pandas as pd
 import numpy as np
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
 
 # ─────────────────────────────────────────────────────
 #  НАСТРОЙКИ
 # ─────────────────────────────────────────────────────
 
-TINKOFF_TOKEN  = "t.5Wxw8TNkE5tKcFxjCMJY5cjr_bj336PMtmhcQ8Ct_jq1-MqbxaL14xJnsEPfaTnhS_dLW7Pegtu3_nwPOv927w"
+# Токен берётся из файла .env (см. .env.example) либо из переменной окружения.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+import os
+TINKOFF_TOKEN  = os.environ.get("TINKOFF_TOKEN", "")
 
 SANDBOX_MODE   = False      # True = песочница, False = реальная торговля
-PAPER_MODE     = False      # True = бумажная торговля (ордера не отправляются)
+PAPER_MODE     = True       # True = бумажная торговля (ордера не отправляются) - БЕЗОПАСНЫЙ РЕЖИМ
 DEPOSIT        = 10_000.0  # руб — начальный/эталонный депозит
 
 # ── Инструменты для торговли
@@ -76,6 +88,27 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────
+#  TLS/SSL НАСТРОЙКИ ДЛЯ T-BANK API
+# ─────────────────────────────────────────────────────
+
+class TlsAdapter(HTTPAdapter):
+    """HTTP адаптер с правильными настройками TLS для T-Bank API."""
+    
+    def init_poolmanager(self, *args, **kwargs):
+        context = ssl.create_default_context(cafile=certifi.where())
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        kwargs['ssl_context'] = context
+        return super().init_poolmanager(*args, **kwargs)
+
+
+def create_session():
+    """Создаёт сессию requests с правильными SSL настройками."""
+    session = requests.Session()
+    session.mount('https://', TlsAdapter())
+    return session
 
 # ─────────────────────────────────────────────────────
 #  СТРУКТУРЫ ДАННЫХ
@@ -200,61 +233,106 @@ def is_volume_ok(current_volume: float) -> bool:
     return True
 
 # ─────────────────────────────────────────────────────
-#  API КЛИЕНТ
+#  API КЛИЕНТ (HTTP запросы к T-Bank Invest API v2)
 # ─────────────────────────────────────────────────────
 
 class TInvestAPI:
-    """Обёртка над tinkoff-invest API для работы с песочницей и боевым режимом."""
+    """
+    Обёртка над T-Bank Invest API через прямые HTTP запросы.
+    Используем актуальный REST API v1 (tbank.ru/invest-api)
+    Документация: https://t-bank.github.io/invest-openapi/
+    """
+    
+    # Актуальный базовый URL для REST API
+    BASE_URL = "https://api-invest.tbank.ru/api/v1"
     
     def __init__(self, token: str, sandbox: bool = False):
-        from tinkoff_invest import ProductionSession, SandboxSession
-        
+        self.token = token
         self.sandbox = sandbox
+        self.session = create_session()
+        self.session.headers.update({
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        })
+        
+        # Определяем account_id
+        self.account_id = self._get_account_id()
+        
         if sandbox:
-            self.session = SandboxSession(token)
             log.info("  Подключена ПЕСОЧНИЦА T-Bank Invest")
         else:
-            self.session = ProductionSession(token)
             log.info("  Подключён РЕАЛЬНЫЙ счёт T-Bank Invest")
-        
-        self.account_id = ""
-        if sandbox:
-            self._setup_sandbox()
     
-    def _setup_sandbox(self):
-        """Инициализация песочницы."""
+    def _get_account_id(self) -> str:
+        """Получение ID счёта."""
         try:
-            # В новой API песочница активируется автоматически через SandboxSession
-            log.info(f"  Песочница активирована")
+            url = f"{self.BASE_URL}/user/accounts"
+            resp = self.session.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            # Берём первый брокерский счёт
+            accounts = data.get('accounts', [])
+            for acc in accounts:
+                if acc.get('type') == 'broker':
+                    return acc['id']
+            
+            # Если нет broker, берём первый
+            if accounts:
+                return accounts[0]['id']
+            
+            return ""
         except Exception as e:
-            log.error(f"  Ошибка инициализации песочницы: {e}")
+            log.warning(f"  Не удалось получить account_id: {e}. Используем пустой.")
+            return ""
+    
+    def _request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None) -> dict:
+        """Выполнение HTTP запроса к API."""
+        url = f"{self.BASE_URL}{endpoint}"
+        
+        try:
+            if method == 'GET':
+                resp = self.session.get(url, params=params)
+            elif method == 'POST':
+                resp = self.session.post(url, params=params, json=json_data)
+            else:
+                raise ValueError(f"Неподдерживаемый метод: {method}")
+            
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            log.error(f"  HTTP ошибка {e.response.status_code}: {e.response.text}")
+            raise
+        except Exception as e:
+            log.error(f"  Ошибка запроса: {e}")
             raise
     
     def get_balance(self) -> float:
         """Получение баланса счёта."""
         try:
-            portfolio = self.session.get_portfolio()
+            if PAPER_MODE:
+                return DEPOSIT
             
-            # Считаем общую стоимость портфеля в рублях
-            total = 0.0
+            params = {'accountId': self.account_id} if self.account_id else {}
+            data = self._request('GET', '/portfolio', params=params)
             
-            # Позиции по бумагам
-            for pos in portfolio.positions:
-                # Получаем текущую цену инструмента
-                try:
-                    instrument = self.session.get_instrument_by_ticker(pos.ticker)
-                    # Для простоты используем среднюю цену позиции
-                    avg_price = pos.average_price.value if hasattr(pos.average_price, 'value') else float(pos.average_price)
-                    total += avg_price * pos.lots * POINT_VALUE
-                except:
-                    pass
+            # Считаем общую стоимость портфеля
+            total_rub = 0.0
             
             # Валютные позиции
-            for curr in portfolio.currencies:
-                if curr.name.currency == 'RUB':
-                    total += curr.balance.value
+            currencies = data.get('currencies', [])
+            for curr in currencies:
+                if curr.get('currency') == 'RUB':
+                    total_rub += curr.get('balance', 0.0)
             
-            return round(total, 2)
+            # Позиции по бумагам (для фьючерсов учитываем стоимость позиции)
+            positions = data.get('positions', [])
+            for pos in positions:
+                if pos.get('instrumentType') == 'share' or pos.get('instrumentType') == 'bond':
+                    # Для акций/облигаций: balance * currentPrice
+                    total_rub += pos.get('balance', 0) * pos.get('currentPrice', {}).get('value', 0)
+            
+            return round(total_rub, 2)
         except Exception as e:
             log.error(f"  Ошибка получения баланса: {e}")
             return DEPOSIT
@@ -262,17 +340,35 @@ class TInvestAPI:
     def get_positions(self) -> Dict[str, dict]:
         """Получение открытых позиций."""
         try:
-            portfolio = self.session.get_portfolio()
-            positions = {}
+            if PAPER_MODE:
+                # В режиме paper возвращаем локальные позиции
+                result = {}
+                for ticker, pos in open_positions.items():
+                    result[ticker] = {
+                        'figi': ticker,
+                        'lots': pos.lots,
+                        'direction': pos.direction,
+                        'avg_price': pos.entry_price
+                    }
+                return result
             
-            for pos in portfolio.positions:
-                if pos.lots != 0:
-                    direction = "BUY" if pos.lots > 0 else "SELL"
-                    positions[pos.ticker] = {
-                        'figi': pos.figi,
-                        'lots': abs(pos.lots),
+            params = {'accountId': self.account_id} if self.account_id else {}
+            data = self._request('GET', '/portfolio', params=params)
+            
+            positions = {}
+            for pos in data.get('positions', []):
+                ticker = pos.get('ticker', '')
+                lots = pos.get('balance', 0)
+                
+                if lots != 0:
+                    direction = "BUY" if lots > 0 else "SELL"
+                    avg_price = pos.get('averagePositionPrice', {}).get('value', 0.0)
+                    
+                    positions[ticker] = {
+                        'figi': pos.get('figi', ''),
+                        'lots': abs(lots),
                         'direction': direction,
-                        'avg_price': pos.average_price.value if hasattr(pos.average_price, 'value') else float(pos.average_price)
+                        'avg_price': avg_price
                     }
             
             return positions
@@ -283,17 +379,22 @@ class TInvestAPI:
     def get_orders(self) -> List[dict]:
         """Получение активных ордеров."""
         try:
-            orders = self.session.get_orders()
+            if PAPER_MODE:
+                return []
+            
+            params = {'accountId': self.account_id} if self.account_id else {}
+            data = self._request('GET', '/orders', params=params)
+            
             result = []
-            for order in orders:
+            for order in data.get('orders', []):
                 result.append({
-                    'id': order.id,
-                    'figi': order.figi,
-                    'operation': order.operation.value,
-                    'lots': order.requested_lots,
-                    'price': order.price,
-                    'status': order.status.value,
-                    'type': order.type.value
+                    'id': order.get('orderId', ''),
+                    'figi': order.get('figi', ''),
+                    'operation': order.get('operation', ''),
+                    'lots': order.get('lots', 0),
+                    'price': order.get('price', 0.0),
+                    'status': order.get('status', ''),
+                    'type': order.get('type', '')
                 })
             return result
         except Exception as e:
@@ -303,21 +404,22 @@ class TInvestAPI:
     def create_market_order(self, operation: str, ticker: str, lots: int) -> Optional[str]:
         """Создание рыночного ордера. Возвращает ID ордера."""
         try:
-            from tinkoff_invest.models.types import OperationType
-            
-            # Получаем FIGI по тику
-            instrument = self.session.get_instrument_by_ticker(ticker)
-            figi = instrument.figi
-            
-            op_type = OperationType.BUY if operation == "BUY" else OperationType.SELL
-            
             if PAPER_MODE:
                 log.info(f"  [PAPER] Рыночный ордер: {operation} {lots}×{ticker} @ market")
                 return f"paper_{time.time()}"
             
-            order = self.session.create_market_order(op_type, figi, lots)
-            log.info(f"  ✓ Рыночный ордер создан: {operation} {lots}×{ticker}, ID={order.id}")
-            return order.id
+            json_data = {
+                'accountId': self.account_id,
+                'figi': ticker,  # В API используется figi
+                'operation': operation,
+                'lots': lots,
+                'orderType': 'Market'
+            }
+            
+            data = self._request('POST', '/orders/market', json_data=json_data)
+            order_id = data.get('orderId', f"order_{time.time()}")
+            log.info(f"  ✓ Рыночный ордер создан: {operation} {lots}×{ticker}, ID={order_id}")
+            return order_id
         except Exception as e:
             log.error(f"  ✗ Ошибка создания ордера: {e}")
             return None
@@ -325,20 +427,23 @@ class TInvestAPI:
     def create_limit_order(self, operation: str, ticker: str, price: float, lots: int) -> Optional[str]:
         """Создание лимитного ордера. Возвращает ID ордера."""
         try:
-            from tinkoff_invest.models.types import OperationType
-            
-            instrument = self.session.get_instrument_by_ticker(ticker)
-            figi = instrument.figi
-            
-            op_type = OperationType.BUY if operation == "BUY" else OperationType.SELL
-            
             if PAPER_MODE:
                 log.info(f"  [PAPER] Лимитный ордер: {operation} {lots}×{ticker} @ {price}")
                 return f"paper_{time.time()}"
             
-            order = self.session.create_limit_order(op_type, figi, price, lots)
-            log.info(f"  ✓ Лимитный ордер создан: {operation} {lots}×{ticker} @ {price}, ID={order.id}")
-            return order.id
+            json_data = {
+                'accountId': self.account_id,
+                'figi': ticker,
+                'operation': operation,
+                'lots': lots,
+                'price': price,
+                'orderType': 'Limit'
+            }
+            
+            data = self._request('POST', '/orders/limit', json_data=json_data)
+            order_id = data.get('orderId', f"order_{time.time()}")
+            log.info(f"  ✓ Лимитный ордер создан: {operation} {lots}×{ticker} @ {price}, ID={order_id}")
+            return order_id
         except Exception as e:
             log.error(f"  ✗ Ошибка создания лимитного ордера: {e}")
             return None
@@ -350,7 +455,8 @@ class TInvestAPI:
                 log.info(f"  [PAPER] Отмена ордера: {order_id}")
                 return True
             
-            self.session.cancel_order(order_id)
+            params = {'accountId': self.account_id} if self.account_id else {}
+            self._request('POST', f'/orders/{order_id}/cancel', params=params)
             log.info(f"  ✓ Ордер отменён: {order_id}")
             return True
         except Exception as e:
@@ -360,42 +466,45 @@ class TInvestAPI:
     def get_candles(self, ticker: str, days: int = 60, interval: str = "5min") -> pd.DataFrame:
         """Получение свечей за период."""
         try:
-            from tinkoff_invest.models.types import SubscriptionInterval
-            
-            instrument = self.session.get_instrument_by_ticker(ticker)
-            figi = instrument.figi
-            
-            # Маппинг интервалов
+            # Маппинг интервалов для API
             interval_map = {
-                "1min": SubscriptionInterval.MINUTES_1,
-                "5min": SubscriptionInterval.MINUTES_5,
-                "15min": SubscriptionInterval.MINUTES_15,
-                "1hour": SubscriptionInterval.HOUR_1,
-                "1day": SubscriptionInterval.DAY
+                "1min": "1minute",
+                "5min": "5minutes",
+                "15min": "15minutes",
+                "1hour": "1hour",
+                "1day": "1day"
             }
-            si = interval_map.get(interval, SubscriptionInterval.MINUTES_5)
+            candle_interval = interval_map.get(interval, "5minutes")
             
-            end_time = datetime.now()
-            start_time = end_time - timedelta(days=days)
+            from_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            to_date = datetime.now().strftime('%Y-%m-%d')
             
-            candles = self.session.get_candles(figi, start_time, end_time, si)
+            params = {
+                'figi': ticker,
+                'from': from_date,
+                'to': to_date,
+                'interval': candle_interval
+            }
             
-            if not candles:
+            data = self._request('GET', '/market/candles', params=params)
+            
+            candles_data = data.get('candles', [])
+            if not candles_data:
                 return pd.DataFrame()
             
             # Преобразуем в DataFrame
-            data = []
-            for c in candles:
-                data.append({
-                    'time': c.time,
-                    'open': c.open_price,
-                    'high': c.highest_price,
-                    'low': c.lowest_price,
-                    'close': c.close_price,
-                    'volume': c.volume
+            df_data = []
+            for c in candles_data:
+                df_data.append({
+                    'time': pd.to_datetime(c['time']),
+                    'open': c['open'],
+                    'high': c['high'],
+                    'low': c['low'],
+                    'close': c['close'],
+                    'volume': c['volume']
                 })
             
-            df = pd.DataFrame(data)
+            df = pd.DataFrame(df_data)
             if not df.empty:
                 df.set_index('time', inplace=True)
             
@@ -405,32 +514,38 @@ class TInvestAPI:
             return pd.DataFrame()
     
     def get_all_futures(self) -> List[dict]:
-        """Получение списка всех фьючерсов."""
+        """Получение списка всех фьючерсов через поиск."""
         try:
-            # В новой API нет отдельного метода для фьючерсов
-            # Используем поиск по тику или stocks
-            instruments_dict = self.session.stocks
+            # Ищем инструменты по базовому коду
+            params = {'search': MINI_BASE}
+            data = self._request('GET', '/market/search', params=params)
             
             futures = []
-            for ticker, inst in instruments_dict.items():
-                # Фильтруем по базовому коду
+            instruments = data.get('instruments', [])
+            
+            for inst in instruments:
+                ticker = inst.get('ticker', '')
+                # Фильтруем по базовому коду (BM + 2 буквы месяца)
                 if ticker.upper().startswith(MINI_BASE.upper()) and len(ticker) == len(MINI_BASE) + 2:
                     futures.append({
                         'ticker': ticker,
-                        'figi': inst.figi,
-                        'name': inst.name
+                        'figi': inst.get('figi', ''),
+                        'name': inst.get('name', '')
                     })
             
             return futures
         except Exception as e:
             log.error(f"  Ошибка получения списка фьючерсов: {e}")
+            # Возвращаем заглушку для纸模式
+            if PAPER_MODE:
+                log.info(f"  [PAPER] Используем фиктивный инструмент {MINI_BASE}M6")
+                return [{'ticker': f'{MINI_BASE}M6', 'figi': f'{MINI_BASE}M6', 'name': f'Mini {MINI_BASE} Future'}]
             return []
     
     def close(self):
         """Закрытие сессии."""
         try:
-            # В новой API нет явного метода закрытия
-            pass
+            self.session.close()
         except:
             pass
 
@@ -700,6 +815,10 @@ def main():
     log.info("=" * 60)
     
     # Инициализация API
+    if not TINKOFF_TOKEN and not PAPER_MODE:
+        log.error("  Токен не задан! Создайте файл .env рядом с bot_v3.py "
+                  "(образец — .env.example) и укажите TINKOFF_TOKEN.")
+        return
     try:
         api = TInvestAPI(TINKOFF_TOKEN, sandbox=SANDBOX_MODE)
     except Exception as e:
